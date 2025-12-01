@@ -68,7 +68,7 @@ class ConfigValidator:
             'optional_keys': {'sample_frequency', 'disable_detection', 'log_fps', 'camera_name'}
         },
         'Relays': {
-            'required_keys': {'0', '1', '2', '3'},
+            'required_keys': {'0'},
             'optional_keys': set()
         }
     }
