@@ -2,7 +2,7 @@
 <img src="https://user-images.githubusercontent.com/51358498/152991504-005a1daa-2900-4f48-8bec-d163d6336ed2.png" width="400">
 </p>
 
-# OpenWeedLocator
+# OpenWeedLocator added to a mechanical weed remover
 
 Welcome to the OpenWeedLocator (OWL) project, an opensource hardware and software weed detector that uses
 entirely off-the-shelf componentry, very simple green-detection algorithms (with capacity to upgrade to
