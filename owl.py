@@ -9,6 +9,10 @@ from datetime import datetime
 from multiprocessing import Process, Value
 from pathlib import Path
 
+######
+from collections import deque
+####    
+
 def get_python_env():
     """Get current Python environment status"""
     venv = os.environ.get('VIRTUAL_ENV')
@@ -62,6 +66,7 @@ try:
 
    from utils.input_manager import UteController, AdvancedController, get_rpi_version
    from utils.output_manager import RelayController, HeadlessStatusIndicator, UteStatusIndicator, AdvancedStatusIndicator
+     
    from utils.directory_manager import DirectorySetup
    from utils.video_manager import VideoStream
    from utils.image_sampler import ImageRecorder
@@ -72,6 +77,8 @@ try:
    from utils.log_manager import LogManager
    import utils.error_manager as errors
    from version import SystemInfo, VERSION
+   #####
+   from utils.weed_puller_manager import WeedPuller
 
 except ImportError as e:
    missing_module = str(e).split("'")[1]
@@ -88,6 +95,7 @@ def nothing(x):
 
 class Owl:
     def __init__(self, show_display=False,
+                 focus=False,
                  input_file_or_directory=None,
                  config_file='config/DAY_SENSITIVITY_2.ini'):
         # set up the logger
@@ -115,6 +123,10 @@ class Owl:
 
         # visualise the detections with video feed
         self.show_display = show_display
+        self.focus = focus
+
+        if self.focus:
+            self.show_display = True
 
         # threshold parameters for different algorithms
         self.exg_min = self.config.getint('GreenOnBrown', 'exg_min')
@@ -155,7 +167,15 @@ class Owl:
             self.relay_dict[int(key)] = int(value)
 
         # instantiate the relay controller - successful start should beep the buzzer
+        # instantiate the weed puller
         try:
+            self.last_actuation_time = 0
+            self.cooldown_secs = 10
+            self.prev_detections = deque(maxlen=10)  # Store up to 5 previous frames' detections
+            self.weed_puller = WeedPuller()
+            self.physical_width_mm = 520  # e.g., physical width of camera view in mm
+            
+            #relay controller is not required but kept due to laziness to edit
             self.relay_controller = RelayController(relay_dict=self.relay_dict)
         except errors.OWLAlreadyRunningError:
             self.logger.critical("OWL initialization failed: GPIO pin conflict. Another OWL instance may be running.",
@@ -301,7 +321,7 @@ class Owl:
         self.relay_num = self.config.getint('System', 'relay_num')
 
         # activation region limit - once weed crosses this line, relay is activated
-        self.yAct = int(0.01 * self.frame_height)
+        self.yAct = int(0.95 * self.frame_height)
         self.lane_width = self.frame_width / self.relay_num
 
         # calculate lane coords and draw on frame
@@ -312,7 +332,16 @@ class Owl:
         # Precompute the integer lane coordinates for reuse
         self.lane_coords_int = {k: int(v) for k, v in self.lane_coords.items()}
 
+    def is_stable_detection(self,current_centre, history, threshold=20):
+        """Returns True if the same weed is consistently detected over time."""
+        for centres in history:
+            if not any(abs(c[0] - current_centre[0]) < threshold and abs(c[1] - current_centre[1]) < threshold for c in centres):
+                return False
+        return True
+
     def hoot(self):
+        self.pixels_per_mm = self.frame_width / self.physical_width_mm
+        print('pixel per mm',self.pixels_per_mm)
         self.record_video = False  # Flag to control video recording
         self.video_writer = None
 
@@ -348,18 +377,22 @@ class Owl:
         except Exception as e:
             algo_error = errors.AlgorithmError(algorithm, e)
             algo_error.handle(self)
-
+            
         if self.show_display:
             self.relay_vis = self.relay_controller.relay_vis
             self.relay_vis.setup()
             self.relay_controller.vis = True
-
+            
         try:
             actuation_duration = self.config.getfloat('System', 'actuation_duration')
             delay = self.config.getfloat('System', 'delay')
 
             while True:
                 frame = self.cam.read()
+
+                if self.focus:
+                    grey = cv2.cvtColor(frame.copy(), cv2.COLOR_BGR2GRAY)
+                    blurriness = fft_blur(grey, size=30)
 
                 if frame is None:
                     if log_fps:
@@ -414,19 +447,32 @@ class Owl:
 
                     # loop over the weed centres
                     for centre in weed_centres:
-                        if centre[1] > self.yAct:
-                            actuation_time = time.time()
-                            centre_x = centre[0]
-
-                            for i in range(self.relay_num):
-                                lane_start = self.lane_coords_int[i]
-                                lane_end = lane_start + self.lane_width
-                                if lane_start <= centre_x < lane_end:
-                                    self.relay_controller.receive(
-                                        relay=i,
-                                        delay=delay,
-                                        time_stamp=actuation_time,
-                                        duration=actuation_duration)
+                        #####
+                        # Store current detections (e.g., from boxes or weed_centres)
+                        self.prev_detections.append(weed_centres)
+                     
+                    # Check for stable detections
+                    for centre in weed_centres:
+                        if self.is_stable_detection(centre, self.prev_detections):
+                            if centre[1] > self.yAct:
+                                
+                                if time.time() - self.last_actuation_time > self.cooldown_secs:                                       
+                                    #print('actuation_time',actuation_time)
+                                    current_position_px = self.weed_puller.motor.position_px
+                                    centre_x = centre[0]
+                                    delta_px = abs(centre_x - current_position_px)
+                                    if delta_px > 20:
+                                        self.last_actuation_time = time.time()
+                                        actuation_time = time.time()
+                                        print('centre_x',centre_x)
+                                        # Convert to mm and pull
+                                        # weed_location_mm = centre[0] / pixels_per_mm
+                                        self.weed_puller.run_sequence(centre_x, self.pixels_per_mm)
+                                        break  # Only act on one weed per cycle
+                                    else:
+                                        print(f"Skipped actuation: target {centre_x:.2f}px is too close to current position {current_position_px:.2f}px")
+                            
+                        #####
 
                 ##### IMAGE SAMPLER #####
                 # record sample images if required of weeds detected. sampleFreq specifies how often
@@ -481,6 +527,10 @@ class Owl:
                                 (80, 80, 255), 1)
                     cv2.putText(image_out, f'Press "S" to save {algorithm} thresholds to file.',
                                 (20, int(image_out.shape[1 ] *0.72)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 255), 1)
+                    if self.focus:
+                        cv2.putText(image_out, f'Blurriness: {blurriness:.2f}', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                                    (80, 80, 255), 1)
+
                     cv2.imshow("Detection Output", imutils.resize(image_out, width=600))
 
                 k = cv2.waitKey(1) & 0xFF
@@ -516,6 +566,12 @@ class Owl:
                 self.logger.info(f"[INFO] Approximate FPS: {fps.fps():.2f}")
             if self.show_display:
                 self.relay_controller.relay_vis.close()
+            
+            #Added
+            #Stopping all Weed puller instances and positioning the claw at home
+            
+            self.weed_puller.__del__() 
+            
             self.logger.info("[INFO] Stopped.")
             self.stop()
 
@@ -567,6 +623,15 @@ class Owl:
                     self.relay_controller.relay.all_off()  # Ensure all relays are off
                 except Exception as e:
                     self.logger.warning(f"Failed to turn off relays: {e}")
+            
+            # Stop weed plucker system
+            if hasattr(self, 'weed_puller') and self.weed_puller:
+                try:
+                    self.weed_puller.cleanup()  # Ensure all motors/actuators stop safely
+                    self.logger.info("Weed plucking system cleaned up successfully.")
+                except Exception as e:
+                    self.logger.warning(f"Failed to clean up weed plucking system: {e}")
+
 
             # Stop camera
             if hasattr(self, 'cam') and self.cam:
@@ -734,22 +799,16 @@ if __name__ == "__main__":
     # opening up the OWL code each time.
     ap = argparse.ArgumentParser()
     ap.add_argument('--show-display', action='store_true', default=False, help='show display windows')
-    ap.add_argument('--focus', action='store_true', default=False, help='(DEPRECATED) launch the focus GUI; please use the desktop icon instead')
+    ap.add_argument('--focus', action='store_true', default=False, help='add FFT blur to output frame')
     ap.add_argument('--input', type=str, default=None, help='path to image directory, single image or video file')
 
     args = ap.parse_args()
-
-    if args.focus:
-        logger.warning("--focus is deprecated, auto-launching focus GUI; please switch to the desktop icon in the future")
-        import desktop.focus_gui
-
-        desktop.focus_gui.main()
-        sys.exit(0)
 
     # this is where you can change the config file default
     owl = Owl(
         config_file='config/DAY_SENSITIVITY_2.ini',
         show_display=args.show_display,
+        focus=args.focus,
         input_file_or_directory=args.input
     )
 
